@@ -1,87 +1,133 @@
-version: "3.8"
+  version: "3.8"
 
-x-airflow-env: &airflow-env
-  AIRFLOW__CORE__EXECUTOR: LocalExecutor
-  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-  AIRFLOW__WEBSERVER__DEFAULT_UI_LANG: en
-  AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
-  AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-  AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE: 5
-  AIRFLOW__DATABASE__SQL_ALCHEMY_MAX_OVERFLOW: 10
+  # Common environment variables for all Airflow services
+  x-airflow-env: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__WEBSERVER__DEFAULT_UI_LANG: en
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE: 5
+    AIRFLOW__DATABASE__SQL_ALCHEMY_MAX_OVERFLOW: 10
+    AIRFLOW__CORE__FERNET_KEY: "81HqDtbqAywKSOumSHMpP91_KbKNaBE1zH19QSVjLQw="
+    AIRFLOW__WEBSERVER__SECRET_KEY: "MyVerySecretKey"
+    AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: 90
+    AIRFLOW__CORE__DAG_FILE_PROCESSOR_TIMEOUT: 300
+    # Snowflake and dbt specific environment variables
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
 
-x-airflow-vols: &airflow-vols
-  - ./dags:/opt/airflow/dags
-  - ./logs:/opt/airflow/logs
-  - ./plugins:/opt/airflow/plugins
+  # Common volume mappings
+  x-airflow-vols: &airflow-vols
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./config:/opt/airflow/config
+    - ./data:/opt/airflow/data
 
-services:
-  postgres:
-    image: postgres:15
-    environment:
-      POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
-      POSTGRES_DB: airflow
-    ports:
-      - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    volumes:
-      - postgres_db_volume:/var/lib/postgresql/data
+  services:
+    # PostgreSQL core database
+    postgres:
+      image: postgres:15
+      environment:
+        POSTGRES_USER: airflow
+        POSTGRES_PASSWORD: airflow
+        POSTGRES_DB: airflow
+      ports:
+        - "5432:5432"
+      healthcheck:
+        test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+      volumes:
+        - postgres_db_volume:/var/lib/postgresql/data
+      restart: always
 
-  airflow-init:
-    build: .
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      <<: *airflow-env
-    entrypoint: /bin/bash
-    command:
-      - -c
-      - |
+    # Airflow initialization: setup DB and user
+    airflow-init:
+      build:
+        context: .
+      depends_on:
+        postgres:
+          condition: service_healthy
+      environment:
+        <<: *airflow-env
+        _AIRFLOW_DB_UPGRADE: 'true'
+        _AIRFLOW_WWW_USER_CREATE: 'true'
+        _AIRFLOW_WWW_USER_USERNAME: admin
+        _AIRFLOW_WWW_USER_PASSWORD: admin
+      entrypoint: /bin/bash
+      command: |
+        -c "
         airflow db init
-        airflow users create \
-          --username admin \
-          --password admin \
-          --firstname Admin \
-          --lastname User \
-          --role Admin \
-          --email admin@example.com
-    volumes: *airflow-vols
+        airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com
+        "
+      volumes: *airflow-vols
+      user: "0:0"
 
-  airflow-webserver:
-    build: .
-    command: webserver
-    restart: always
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      <<: *airflow-env
-    ports:
-      - "8080:8080"
-    healthcheck:
-      test: ["CMD-SHELL", "curl --fail http://localhost:8080/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    volumes: *airflow-vols
+    # Airflow Webserver
+    airflow-webserver:
+      build:
+        context: .
+      command: webserver
+      restart: always
+      depends_on:
+        postgres:
+          condition: service_healthy
+        airflow-init:
+          condition: service_completed_successfully
+      environment:
+        <<: *airflow-env
+      ports:
+        - "8080:8080"
+      healthcheck:
+        test: ["CMD-SHELL", "curl --fail http://localhost:8080/health || exit 1"]
+        interval: 10s
+        timeout: 5s
+        retries: 3
+      volumes: *airflow-vols
 
-  airflow-scheduler:
-    build: .
-    command: scheduler
-    restart: always
-    depends_on:
-      postgres:
-        condition: service_healthy
-      airflow-webserver:
-        condition: service_started
-    environment:
-      <<: *airflow-env
-    volumes: *airflow-vols
+    # Airflow Scheduler
+    airflow-scheduler:
+      build:
+        context: .
+      command: scheduler
+      restart: always
+      depends_on:
+        postgres:
+          condition: service_healthy
+        airflow-webserver:
+          condition: service_started
+      environment:
+        <<: *airflow-env
+      volumes: *airflow-vols
+      healthcheck:
+        test: ["CMD-SHELL", "pgrep -f 'airflow scheduler' || exit 1"]
+        interval: 30s
+        timeout: 10s
+        retries: 3
 
-volumes:
-  postgres_db_volume:
+    # Optional Triggerer (for DAGs that support it)
+    airflow-triggerer:
+      build:
+        context: .
+      command: triggerer
+      restart: always
+      depends_on:
+        postgres:
+          condition: service_healthy
+        airflow-init:
+          condition: service_completed_successfully
+      environment:
+        <<: *airflow-env
+      volumes: *airflow-vols
+      healthcheck:
+        test: ["CMD-SHELL", "pgrep -f 'airflow triggerer' || exit 1"]
+        interval: 30s
+        timeout: 10s
+        retries: 3
+
+  volumes:
+    postgres_db_volume:
